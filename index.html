@@ -4,7 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>网站访问诊断 · 全功能版</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css">
 <style>
   :root{--bg:#0b1220;--card:#131c2f;--card2:#0f1729;--line:#243049;--txt:#e6edf7;--dim:#93a4bf;
     --ok:#22c55e;--bad:#ef4444;--warn:#f59e0b;--info:#3b82f6;--pur:#a855f7;--cy:#06b6d4}
@@ -90,7 +89,6 @@
   </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 "use strict";
 /* ============== 工具 ============== */
@@ -140,11 +138,18 @@ async function doh(dns,domain,type="A"){
 const D={}; // 汇总数据
 
 async function mTester(){
+  // 测试者公网信息：改用国内源 v2.xxapi.cn（ipinfo 在部分国内网络被墙）
   try{
-    const me=await jget("https://ipinfo.io/json",{},7000).catch(async()=>await jget("https://api.ipify.org?format=json",{},7000));
-    D.tester={ip:me.ip, city:me.city, region:me.region, country:me.country, org:me.org, loc:me.loc};
-  }catch(e){ D.tester={err:"获取失败"}; }
-  // 公网 IPv4 / IPv6
+    const me=await jget("https://v2.xxapi.cn/api/ip",{},8000);
+    const loc=(me.data&&me.data.lat!=null)?(me.data.lat+","+me.data.lng):null;
+    D.tester={ip:me.data.ip, city:(me.data.address||"").split(" ").pop(), region:me.data.address,
+      country:me.data.address, org:me.data.isp, loc};
+  }catch(e){
+    // 降级到 ipinfo / ipify
+    try{ const me=await jget("https://ipinfo.io/json",{},7000); D.tester={ip:me.ip,city:me.city,region:me.region,country:me.country,org:me.org,loc:me.loc}; }
+    catch(_){ try{ const ip=(await jget("https://api.ipify.org?format=json",{},6000)).ip; D.tester={ip}; }catch(__){ D.tester={err:"获取失败"}; } }
+  }
+  // 公网 IPv4 / IPv6（ipify）
   D.v4=await jget("https://api.ipify.org?format=json",{},6000).then(r=>r.ip).catch(()=>null);
   D.v6=await jget("https://api6.ipify.org?format=json",{},6000).then(r=>r.ip).catch(()=>null);
   // NAT 线索 (WebRTC)
@@ -213,19 +218,24 @@ async function mDNS(domain){
   const aR=await doh(DNSR[2],domain,"A");
   const aaaaR=await doh(DNSR[2],domain,"AAAA");
   D.dns.a=aR.ips||[]; D.dns.aaaa=aaaaR.ips||[];
-  // 地理 + CDN
+  // 地理 + CDN（服务端 IP 地理改用国内源 v2.xxapi.cn）
   D.dns.servers=[];
   for(const ip of D.dns.a.concat(D.dns.aaaa)){
     let g={ip};
-    try{ const j=await jget("https://ipinfo.io/"+ip+"/json",{},6000);
-      g={ip, city:j.city, region:j.region, country:j.country, org:j.org, loc:j.loc, anycast:!!j.anycast}; }
+    try{ const j=await jget("https://v2.xxapi.cn/api/ip?ip="+ip,{},6000);
+      const d=j.data||{};
+      g={ip, city:d.address, region:d.address, country:d.address, org:d.address, loc:(d.lat!=null&&d.lng!=null)?(d.lat+","+d.lng):null}; }
     catch(_){ }
     g.isCF=isCF(ip);
     D.dns.servers.push(g);
   }
-  // CDN 判定
-  const orgs=D.dns.servers.map(s=>s.org||"").join(" ");
-  const cdn=guessCDN(orgs);
+  // CDN 判定：Cloudflare 用 IP 段直接判断；其余尝试 ipinfo 的 org 字段（外网，可能不可达→降级）
+  let cdn=null;
+  if(D.dns.servers.some(s=>s.isCF)) cdn="Cloudflare";
+  if(!cdn){
+    for(const s of D.dns.servers){ try{ const j=await jget("https://ipinfo.io/"+s.ip+"/json",{},5000); if(j.org){ const n=guessCDN(j.org); if(n){cdn=n; s.org=j.org; break;} } }catch(_){} }
+  }
+  if(!cdn) cdn=null;
   D.dns.cdn=cdn;
   // 截图(尽力)
   D.shot="https://image.thum.io/get/width/720/https://"+domain+"/";
@@ -248,6 +258,21 @@ function guessCDN(org){
 }
 
 async function mWho(domain){
+  // 主用国内源 v2.xxapi.cn（RDAP 在国内常被拦），RDAP 作为降级
+  try{
+    const j=await jget("https://v2.xxapi.cn/api/whois?domain="+domain,{},9000);
+    if(j&&j.code===200&&j.data){
+      const d=j.data, dd=d.data||{};
+      D.whois={ok:true,
+        registrar:dd.sponsoring_registrar||(d["Registrar URL"]?("注册商: "+d["Registrar URL"]):"")||"—",
+        registered:dd.registration_time||d["Registration Time"],
+        expires:dd.expiration_time||d["Expiration Time"],
+        status:(dd.domain_status||d["domain_status"]||"").split(" "),
+        ns:dd.dns_serve||d["DNS Serve"], raw:j};
+      return;
+    }
+  }catch(_){}
+  // 降级 RDAP
   const tld=(domain.split(".").pop()||"").toLowerCase();
   const map={com:"https://rdap.verisign.com/com/v1/domain/",net:"https://rdap.verisign.com/net/v1/domain/",
     org:"https://rdap.publicinterestregistry.net/rdap/domain/",cn:"https://rdap.cnnic.cn/domain/",
@@ -256,15 +281,8 @@ async function mWho(domain){
   try{
     const j=await jget(base+domain,{},9000);
     let registrar="",reg="",exp="";
-    (j.entities||[]).forEach(e=>{
-      if((e.roles||[]).includes("registrar")){
-        registrar=e.vcardArray?vc(e.vcardArray):(e.name||registrar);
-      }
-    });
-    (j.events||[]).forEach(e=>{
-      if(e.eventAction==="registration")reg=e.eventDate;
-      if(e.eventAction==="expiration"||e.eventAction==="registration expiration")exp=e.eventDate;
-    });
+    (j.entities||[]).forEach(e=>{ if((e.roles||[]).includes("registrar")) registrar=e.vcardArray?vc(e.vcardArray):(e.name||registrar); });
+    (j.events||[]).forEach(e=>{ if(e.eventAction==="registration")reg=e.eventDate; if(e.eventAction==="expiration"||e.eventAction==="registration expiration")exp=e.eventDate; });
     D.whois={ok:true, registrar, registered:reg, expires:exp, status:(j.status||[]), raw:j};
   }catch(e){ D.whois={ok:false, err:e.message}; }
 }
@@ -390,17 +408,44 @@ function haversine(a,b){const R=6371,d=x=>x*Math.PI/180;
   const s=Math.sin(dLat/2)**2+Math.cos(d(a.lat))*Math.cos(d(b.lat))*Math.sin(dLon/2)**2;
   return Math.round(2*R*Math.asin(Math.sqrt(s)));}
 function drawMap(me,servers){
-  if(typeof L==="undefined"){ $("map").innerHTML="<div class='hint'>地图库加载失败（被网络拦截），仅显示坐标。</div>"; return; }
-  try{
-    const pts=[]; if(me)pts.push([me.lat,me.lon]); servers.forEach(s=>pts.push([s.lat,s.lon]));
-    const c=pts.length?pts.reduce((a,p)=>[a[0]+p[0]/pts.length,a[1]+p[1]/pts.length]):[20,110];
-    const map=L.map($("map"),{worldCopyJump:true}).setView(c,Math.max(1,pts.length?3:2));
-    L.tileLayer("https://webrd0{t}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}",{subdomains:"1234",maxZoom:18}).addTo(map);
-    if(me)L.circleMarker([me.lat,me.lon],{color:"#22c55e",fillColor:"#22c55e",r:7}).addTo(map).bindPopup("你（"+esc(me.city||"")+"）");
-    servers.forEach(s=>L.circleMarker([s.lat,s.lon],{color:"#ef4444",fillColor:"#ef4444",r:7}).addTo(map).bindPopup(esc(s.ip+(s.org?" · "+s.org:""))));
-    if(me&&servers[0])L.polyline([[me.lat,me.lon],[servers[0].lat,servers[0].lon]],{color:"#06b6d4",dashArray:"5,5"}).addTo(map);
-    setTimeout(()=>map.invalidateSize(),300);
-  }catch(e){ $("map").innerHTML="<div class='hint'>地图渲染失败："+esc(e.message)+"</div>"; }
+  // 零依赖自绘：等距圆柱投影 + 经纬网格 + 两点连线 + 距离标注（不依赖任何外部 CDN）
+  const box=$("map"); box.innerHTML="";
+  const W=box.clientWidth||600, H=300, pad=24;
+  const cv=document.createElement("canvas"); cv.width=W; cv.height=H; cv.style.width=W+"px"; cv.style.height=H+"px";
+  box.appendChild(cv);
+  const ctx=cv.getContext("2d");
+  const X=lon=>(lon+180)/360*(W-2*pad)+pad;
+  const Y=lat=>(90-lat)/180*(H-2*pad)+pad;
+  // 背景
+  ctx.fillStyle="#0a0f1c"; ctx.fillRect(0,0,W,H);
+  // 经纬网格
+  ctx.strokeStyle="rgba(148,163,184,.16)"; ctx.lineWidth=1; ctx.font="9px sans-serif"; ctx.fillStyle="#5b6b85";
+  for(let lon=-150;lon<=150;lon+=30){ ctx.beginPath();ctx.moveTo(X(lon),pad);ctx.lineTo(X(lon),H-pad);ctx.stroke(); }
+  for(let lat=-60;lat<=60;lat+=30){ ctx.beginPath();ctx.moveTo(pad,Y(lat));ctx.lineTo(W-pad,Y(lat));ctx.stroke(); }
+  // 赤道加粗
+  ctx.strokeStyle="rgba(148,163,184,.35)";ctx.beginPath();ctx.moveTo(pad,Y(0));ctx.lineTo(W-pad,Y(0));ctx.stroke();
+  const pts=(me?[me]:[]).concat(servers);
+  if(pts.length<1){ box.insertAdjacentHTML("beforeend",'<div class="hint">未获取到可用于绘图的位置数据。</div>'); return; }
+  // 连线
+  if(me&&servers[0]){
+    ctx.strokeStyle="#06b6d4"; ctx.setLineDash([5,4]); ctx.lineWidth=1.5;
+    ctx.beginPath();ctx.moveTo(X(me.lon),Y(me.lat));ctx.lineTo(X(servers[0].lon),Y(servers[0].lat));ctx.stroke();ctx.setLineDash([]);
+  }
+  // 标记
+  const drawPt=(p,color,label)=>{
+    ctx.fillStyle=color;ctx.strokeStyle="#0b1220";ctx.lineWidth=2;
+    ctx.beginPath();ctx.arc(X(p.lon),Y(p.lat),6,0,Math.PI*2);ctx.fill();ctx.stroke();
+    ctx.fillStyle="#cbd5e1";ctx.font="11px sans-serif";ctx.fillText(label,X(p.lon)+10,Y(p.lat)+4);
+  };
+  if(me) drawPt(me,"#22c55e","你");
+  servers.forEach((s,i)=>drawPt(s,"#ef4444","服务器"+(servers.length>1?(""+(i+1)):"")));
+  // 距离标注
+  if(me&&servers[0]){
+    const d=haversine(me,servers[0]);
+    ctx.fillStyle="#06b6d4";ctx.font="11px sans-serif";
+    ctx.fillText("相距约 "+d.toLocaleString()+" km",pad+4,H-pad+16);
+  }
+  box.insertAdjacentHTML("beforeend",'<div class="hint">简化经纬度图（等距圆柱投影，无底图），仅用于直观显示两端相对位置与距离。</div>');
 }
 
 function rShot(){
