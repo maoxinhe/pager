@@ -277,24 +277,25 @@ function vc(arr){ // 简易 vCard 解析
 
 /* ICP 备案（尽力，国内免费源大多不可用） */
 async function mICP(domain){
-  const sources=[
-    "https://api.pearktrue.cn/api/icp/?url="+domain,
-    "https://www.beianx.cn/api/icp?domain="+domain,
-    "https://api.iw3.cn/api/icp?url="+domain
-  ];
-  for(const u of sources){
+  // 主用：apihz.cn（文章提供的公共 id/key，免费但为共享配额，可能被限频）。
+  // 无备案域名返回 code:200 但 icp="查询失败"，需按通道重试并据此区分“未备案/接口挂”。
+  const ID="88888888", KEY="88888888";
+  let reached=false;
+  for(const type of [0,1,2]){           // 0=默认随机；失败按文章建议切换通道 1/2
     try{
+      const u=`https://cn.apihz.cn/api/wangzhan/icp.php?id=${ID}&key=${KEY}&domain=${domain}${type?("&type="+type):""}`;
       const r=await jget(u,{},9000);
-      if(r&&(r.data||r.icp||r.success||r.list)){
-        const o=r.data||r;
-        D.icp={ok:true, company:o.companyName||o.unitName||o.name,
-          no:o.serviceLicence||o.siteLicence||o.no,
-          nature:o.natureName||o.type, raw:r};
-        return;
+      reached=true;
+      if(r&&r.code===200&&r.icp&&r.icp!=="查询失败"&&r.unit!=="查询失败"){
+        D.icp={ok:true, company:r.unit, no:r.icp, nature:r.type||"", time:r.time, raw:r}; return;
       }
     }catch(_){}
   }
-  D.icp={ok:false, note:"公开备案查询接口暂不可用，请到 beian.miit.gov.cn 手动核验"};
+  if(reached){
+    D.icp={ok:false, note:"apihz 返回「查询失败」：该域名可能未备案，或查询通道临时不可用。请到 beian.miit.gov.cn 复核。"};
+    return;
+  }
+  D.icp={ok:false, note:"免费 ICP 查询接口暂不可用（接口频繁关停/被墙）。请到 beian.miit.gov.cn 手动核验备案状态。"};
 }
 
 /* ============== 渲染 ============== */
